@@ -19,7 +19,9 @@ torch.manual_seed(31)
 torch.cuda.manual_seed_all(31)
 np.random.seed(31)
 
-__all__ = ['Kmeans', 'cluster_assign']
+
+
+
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -39,39 +41,19 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def learning_rate_decay(optimizer, t, lr_0):
-    for param_group in optimizer.param_groups:
-        lr = lr_0 / np.sqrt(1 + lr_0 * param_group['weight_decay'] * t)
-        param_group['lr'] = lr
-
-
-class Logger(object):
-    """ Class to update every epoch to keep trace of the results
-    Methods:
-        - log() log and save
-    """
-
-    def __init__(self, path):
-        self.path = path
-        self.data = []
-
-    def log(self, train_point):
-        self.data.append(train_point)
-        with open(os.path.join(self.path), 'wb') as fp:
-            pickle.dump(self.data, fp, -1)
-
 class UnifLabelSampler(Sampler):
-  """Samples elements uniformly accross pseudolabels.
+    """Samples elements uniformely accross pseudolabels.
         Args:
             N (int): size of returned iterator.
             images_lists: dict of key (target), value (list of data with this target)
-  """
-  def __init__(self, N, images_lists):
+    """
+
+    def __init__(self, N, images_lists):
         self.N = N
         self.images_lists = images_lists
         self.indexes = self.generate_indexes_epoch()
 
-  def generate_indexes_epoch(self):
+    def generate_indexes_epoch(self):
         nmb_non_empty_clusters = 0
         for i in range(len(self.images_lists)):
             if len(self.images_lists[i]) != 0:
@@ -98,11 +80,13 @@ class UnifLabelSampler(Sampler):
         res += res[: (self.N - len(res))]
         return res
 
-  def __iter__(self):
+    def __iter__(self):
         return iter(self.indexes)
 
-  def __len__(self):
+    def __len__(self):
         return len(self.indexes)
+
+
 
 class ReassignedDataset(data.Dataset):
     """A dataset where the new images labels are given in argument.
@@ -120,10 +104,11 @@ class ReassignedDataset(data.Dataset):
         self.transform = transform
 
     def make_dataset(self, image_indexes, pseudolabels, dataset):
+        #print('Make Dataset')
         label_to_idx = {label: idx for idx, label in enumerate(set(pseudolabels))}
         images = []
         for j, idx in enumerate(image_indexes):
-            path = dataset[idx]
+            path = dataset[idx][0]
             pseudolabel = label_to_idx[pseudolabels[j]]
             images.append((path, pseudolabel))
         return images
@@ -135,65 +120,14 @@ class ReassignedDataset(data.Dataset):
         Returns:
             tuple: (image, pseudolabel) where pseudolabel is the cluster of index datapoint
         """
-        img, pseudolabel = self.imgs[index]
+        path, pseudolabel = self.imgs[index]
+        img = pil_loader(path)
         if self.transform is not None:
             img = self.transform(img)
         return img, pseudolabel
 
     def __len__(self):
         return len(self.imgs)
-
-def preprocess_features(npdata, pca=32, eps=1e-5):
-    """Preprocess an array of features.
-    Args:
-        npdata (np.array N * ndim): features to preprocess
-        pca (int): initial dim of output
-    Returns:
-        np.array of dim N * pca: data PCA-reduced, whitened and L2-normalized
-    """
-    _, ndim = npdata.shape
-    npdata = npdata.astype('float32')
-    npdata = npdata - np.mean(npdata, axis=0)
-
-    # Apply PCA-whitening with Faiss
-    mat = faiss.PCAMatrix (ndim, pca, eigen_power=-0.5)
-    mat.train(npdata)
-    assert mat.is_trained
-    eigs = faiss.vector_to_array(mat.eigenvalues)
-    pca = np.argwhere(np.cumsum(sorted(eigs/np.sum(eigs), reverse=True)) >= 0.95)[0, 0]
-    mat = faiss.PCAMatrix(ndim, int(pca), eigen_power=-0.5)
-    mat.train(npdata)
-    assert mat.is_trained
-
-    npdata = mat.apply_py(npdata)
-    # L2 normalization
-    row_sums = np.linalg.norm(npdata, axis=1)
-    npdata = npdata / np.clip(row_sums[:, np.newaxis], eps, None)
-
-    return npdata
-
-
-def make_graph(xb, nnn):
-    """Builds a graph of nearest neighbors.
-    Args:
-        xb (np.array): data
-        nnn (int): number of nearest neighbors
-    Returns:
-        list: for each data the list of ids to its nnn nearest neighbors
-        list: for each data the list of distances to its nnn NN
-    """
-    N, dim = xb.shape
-
-    # we need only a StandardGpuResources per GPU
-    res = faiss.StandardGpuResources()
-
-    # L2
-    flat_config = faiss.GpuIndexFlatConfig()
-    flat_config.device = int(torch.cuda.device_count()) - 1
-    index = faiss.GpuIndexFlatL2(res, dim, flat_config)
-    index.add(xb)
-    D, I = index.search(xb, nnn + 1)
-    return I, D
 
 
 def cluster_assign(images_lists, dataset):
@@ -209,14 +143,50 @@ def cluster_assign(images_lists, dataset):
     assert images_lists is not None
     pseudolabels = []
     image_indexes = []
+
+    #print('Assigning CLusters')
     for cluster, images in enumerate(images_lists):
         image_indexes.extend(images)
         pseudolabels.extend([cluster] * len(images))
 
-    return ReassignedDataset(image_indexes, pseudolabels, dataset, None)
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+    t = transforms.Compose([transforms.RandomResizedCrop(224),
+                            transforms.RandomHorizontalFlip(),
+                            transforms.ToTensor(),
+                            normalize])
+
+    return ReassignedDataset(image_indexes, pseudolabels, dataset, t)
 
 
-def run_kmeans(x, nmb_clusters, verbose=False):
+
+def preprocess_features(npdata, pca=256):
+    """Preprocess an array of features.
+    Args:
+        npdata (np.array N * ndim): features to preprocess
+        pca (int): dim of output
+    Returns:
+        np.array of dim N * pca: data PCA-reduced, whitened and L2-normalized
+    """
+    _, ndim = npdata.shape
+    npdata =  npdata.astype('float32')
+
+    #Apply PCA-whitening with Faiss
+    #print('PCA')
+    # mat = faiss.PCAMatrix (ndim, pca, eigen_power=-0.5)
+    # mat.train(npdata)
+    # assert mat.is_trained
+    # npdata = mat.apply_py(npdata)
+
+    # L2 normalization
+    row_sums = np.linalg.norm(npdata, axis=1)
+    npdata = npdata / row_sums[:, np.newaxis]
+
+    return npdata
+
+
+
+def run_kmeans(x, nmb_clusters, verbose=True):
     """Runs kmeans on 1 GPU.
     Args:
         x: data
@@ -236,23 +206,24 @@ def run_kmeans(x, nmb_clusters, verbose=False):
 
     clus.niter = 20
     clus.max_points_per_centroid = 10000000
-    try:
-        res = faiss.StandardGpuResources()
-        flat_config = faiss.GpuIndexFlatConfig()
-        flat_config.useFloat16 = False
-        flat_config.device = 0
-        index = faiss.GpuIndexFlatL2(res, d, flat_config)
-    except:
-        index = faiss.IndexFlatL2(d)
+    res = faiss.StandardGpuResources()
+    flat_config = faiss.GpuIndexFlatConfig()
+    flat_config.useFloat16 = False
+    flat_config.device = 0
+    index = faiss.GpuIndexFlatL2(res, d, flat_config)
 
     # perform the training
+    #print('Cluster Training')
     clus.train(x, index)
     _, I = index.search(x, 1)
+
+    #print('Cluster Lose ')
     losses = faiss.vector_to_array(clus.obj)
-    if verbose:
-        print('k-means loss evolution: {0}'.format(losses))
+    
+    #print('k-means loss evolution: {0}'.format(losses))
 
     return [int(n[0]) for n in I], losses[-1]
+
 
 class Kmeans(object):
     def __init__(self, k):
@@ -266,15 +237,17 @@ class Kmeans(object):
         end = time.time()
 
         # PCA-reducing, whitening and L2-normalization
+        #print('preprocess Features')
         xb = preprocess_features(data)
 
         # cluster the data
+        #print('Run Kmeans')
         I, loss = run_kmeans(xb, self.k, verbose)
         self.images_lists = [[] for i in range(self.k)]
         for i in range(len(data)):
             self.images_lists[I[i]].append(i)
 
-        if verbose:
-            print('k-means time: {0:.0f} s'.format(time.time() - end))
+        #if verbose:
+            #print('k-means time: {0:.0f} s'.format(time.time() - end))
 
         return loss
